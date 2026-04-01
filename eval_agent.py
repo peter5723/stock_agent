@@ -1,7 +1,9 @@
 import argparse
 import concurrent.futures
+import ast
 import json
 import os
+os.environ["NO_PROXY"] = "127.0.0.1,localhost,0.0.0.0"
 import re
 import statistics
 import time
@@ -10,6 +12,13 @@ from typing import Any
 
 import pandas as pd
 import requests
+
+try:
+    from multi_agent import build_app
+
+    multi_agent_app = build_app()
+except Exception:
+    multi_agent_app = None
 
 @dataclass
 class EvalCase:
@@ -104,59 +113,6 @@ def build_eval_cases(stocks: list[str]) -> list[EvalCase]:
     return cases
 
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_fundamental_data",
-            "description": "获取A股股票基本面核心数据",
-            "parameters": {
-                "type": "object",
-                "properties": {"stock_code": {"type": "string", "description": "A股股票代码，例如600519"}},
-                "required": ["stock_code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_technical_data",
-            "description": "获取A股股票技术面均线和价格数据",
-            "parameters": {
-                "type": "object",
-                "properties": {"stock_code": {"type": "string", "description": "A股股票代码，例如600519"}},
-                "required": ["stock_code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_news_sentiment",
-            "description": "获取A股股票新闻情绪与风险标签",
-            "parameters": {
-                "type": "object",
-                "properties": {"stock_code": {"type": "string", "description": "A股股票代码，例如600519"}},
-                "required": ["stock_code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_valuation_data",
-            "description": "获取A股股票估值分位信息",
-            "parameters": {
-                "type": "object",
-                "properties": {"stock_code": {"type": "string", "description": "A股股票代码，例如600519"}},
-                "required": ["stock_code"],
-            },
-        },
-    },
-]
-
-TOOL_MAP: dict[str, Any] = {}
-
 JUDGE_PROMPT = """
 你是一个客观冷酷的量化基金首席风控官。请对输入的 AI 股票研报进行质量打分（满分 60 分）。
 仅评估以下两点：
@@ -169,18 +125,11 @@ JUDGE_PROMPT = """
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Agent工具调用评测")
-    parser.add_argument("--base-url", default=os.getenv("QWEN_BASE_URL", "http://127.0.0.1:8000/v1"))
-    parser.add_argument("--model", default=os.getenv("QWEN_MODEL", "qwen2.5-7b-instruct"))
-    parser.add_argument("--api-key", default=os.getenv("QWEN_API_KEY", "EMPTY"))
-    parser.add_argument("--request-timeout", type=int, default=int(os.getenv("EVAL_TIMEOUT", "120")))
-    parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--output-prefix", default=os.getenv("EVAL_OUTPUT_PREFIX", "agent_eval"))
     parser.add_argument("--enable-llm-judge", action="store_true")
     parser.add_argument("--suite", choices=["smoke", "full"], default="smoke")
     parser.add_argument("--stocks", default="")
-    parser.add_argument("--max-retries", type=int, default=2)
-    parser.add_argument("--disable-tool-fallback", action="store_true")
-    parser.add_argument("--tool-workers", type=int, default=4)
+    parser.add_argument("--case-workers", type=int, default=4, help="并发评测多少个股票 Case")
     return parser.parse_args()
 
 
@@ -191,58 +140,6 @@ def resolve_stocks(args: argparse.Namespace) -> list[str]:
     if args.suite == "full":
         return DEFAULT_STOCKS_FULL
     return DEFAULT_STOCKS_SMOKE
-
-
-def load_tool_map() -> None:
-    global TOOL_MAP
-    from tools_mcp import get_fundamental_data, get_news_sentiment, get_technical_data, get_valuation_data
-
-    TOOL_MAP = {
-        "get_fundamental_data": get_fundamental_data,
-        "get_technical_data": get_technical_data,
-        "get_news_sentiment": get_news_sentiment,
-        "get_valuation_data": get_valuation_data,
-    }
-
-
-def resolve_runtime_model(base_url: str, requested_model: str, api_key: str, timeout: int) -> str:
-    try:
-        response = requests.get(
-            f"{base_url.rstrip('/')}/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        models = response.json().get("data", [])
-        ids = [x.get("id") for x in models if x.get("id")]
-        if requested_model in ids:
-            return requested_model
-        return ids[0] if ids else requested_model
-    except Exception:
-        return requested_model
-
-
-def normalize_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
-    if not isinstance(raw_tool_calls, list):
-        return []
-    normalized = []
-    for idx, item in enumerate(raw_tool_calls):
-        if not isinstance(item, dict):
-            continue
-        function_obj = item.get("function") if isinstance(item.get("function"), dict) else {}
-        tool_name = function_obj.get("name")
-        if not tool_name:
-            continue
-        normalized.append(
-            {
-                "id": item.get("id") or f"tool_call_{idx}",
-                "function": {
-                    "name": tool_name,
-                    "arguments": function_obj.get("arguments") or "{}",
-                },
-            }
-        )
-    return normalized
 
 
 def objective_eval(report_text: str) -> dict[str, Any]:
@@ -284,67 +181,6 @@ def llm_subjective_eval(report_text: str) -> dict[str, Any]:
         return {"llm_score": 0, "reasoning": f"评测解析失败: {exc}"}
 
 
-def call_chat_completion(
-    base_url: str,
-    model: str,
-    api_key: str,
-    messages: list[dict[str, Any]],
-    timeout: int,
-    temperature: float,
-    tools: list[dict[str, Any]] | None = None,
-    max_retries: int = 2,
-) -> tuple[dict[str, Any], float]:
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-    }
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
-    start = time.perf_counter()
-    last_exc: Exception | None = None
-    for _ in range(max(1, max_retries + 1)):
-        try:
-            response = requests.post(
-                f"{base_url.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json=payload,
-                timeout=timeout,
-            )
-            if response.status_code == 404:
-                payload["model"] = resolve_runtime_model(base_url, payload["model"], api_key, timeout)
-                response = requests.post(
-                    f"{base_url.rstrip('/')}/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json=payload,
-                    timeout=timeout,
-                )
-            response.raise_for_status()
-            latency_s = time.perf_counter() - start
-            return response.json(), latency_s
-        except Exception as exc:
-            last_exc = exc
-            continue
-    raise RuntimeError(f"chat/completions请求失败: {last_exc}")
-
-
-def invoke_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    if not TOOL_MAP:
-        load_tool_map()
-    if name not in TOOL_MAP:
-        return {"status": "error", "message": f"未注册工具: {name}"}
-    result = TOOL_MAP[name].invoke(arguments)
-    if isinstance(result, dict):
-        return result
-    if isinstance(result, str):
-        try:
-            return json.loads(result)
-        except json.JSONDecodeError:
-            return {"status": "error", "message": f"工具返回了非JSON字符串: {result[:200]}"}
-    return {"status": "error", "message": f"工具返回类型不支持: {type(result).__name__}"}
-
-
 def validate_consistency(tool_name: str, tool_output: dict[str, Any]) -> tuple[bool, str]:
     if tool_output.get("status") != "success":
         return False, tool_output.get("message", "status非success")
@@ -362,7 +198,7 @@ def validate_consistency(tool_name: str, tool_output: dict[str, Any]) -> tuple[b
     if tool_name == "get_news_sentiment":
         sentiment = str(tool_output.get("sentiment", "")).lower()
         score = tool_output.get("score")
-        ok = sentiment in {"positive", "negative", "neutral", "中性", "利好", "利空"} and isinstance(score, (int, float))
+        ok = sentiment in {"positive", "negative", "neutral", "中性", "利好", "利空","积极", "消极"} and isinstance(score, (int, float))
         return (True, "ok") if ok else (False, "新闻情绪格式不符合预期")
     if tool_name == "get_valuation_data":
         percentile = tool_output.get("pe_percentile_3y")
@@ -391,154 +227,85 @@ def build_optimization_suggestions(summary: dict[str, Any]) -> list[str]:
     return suggestions
 
 
-def synthesize_report_from_tools(case: EvalCase, tool_call_metrics: list[dict[str, Any]], reason: str) -> str:
-    tools = {x["tool_name"]: x["tool_output"] for x in tool_call_metrics}
-    fundamental = tools.get("get_fundamental_data", {})
-    technical = tools.get("get_technical_data", {})
-    news = tools.get("get_news_sentiment", {})
-    valuation = tools.get("get_valuation_data", {})
-    lines = [
-        "## 核心投资结论",
-        f"- 标的：{case.stock_code}",
-        f"- 当前价格：{fundamental.get('current_price', 'N/A')}",
-        f"- PE(TTM)：{fundamental.get('pe_ratio_ttm', valuation.get('current_pe', 'N/A'))}",
-        f"- PB：{fundamental.get('pb_ratio', 'N/A')}",
-        f"- 50日均线：{technical.get('fifty_day_average', 'N/A')}",
-        f"- 新闻情绪：{news.get('sentiment', 'N/A')}（score={news.get('score', 'N/A')}）",
-        f"- 估值分位：{valuation.get('pe_percentile_3y', 'N/A')}%",
-        "",
-        "## 风险提示",
-        f"- 本次为降级生成，原因：{reason}",
-        "- 建议结合公告、财报和盘中量价变化做二次确认。",
+def parse_state_dict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            obj = json.loads(text)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            pass
+        try:
+            obj = ast.literal_eval(text)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def build_tool_metrics_from_state(state: dict[str, Any], case: EvalCase) -> list[dict[str, Any]]:
+    mapping = [
+        ("get_fundamental_data", "fundamental_data"),
+        ("get_technical_data", "technical_data"),
+        ("get_news_sentiment", "news_data"),
+        ("get_valuation_data", "valuation_data"),
     ]
-    return "\n".join(lines)
-
-
-def resolve_tool_workers(args: argparse.Namespace, tool_call_count: int) -> int:
-    workers = max(1, min(args.tool_workers, tool_call_count))
-    if os.getenv("BAOSTOCK_SOCKS5_PROXY", "").strip():
-        return 1
-    return workers
+    metrics: list[dict[str, Any]] = []
+    for idx, (tool_name, state_key) in enumerate(mapping):
+        tool_id = f"state_{idx}"
+        tool_output = parse_state_dict(state.get(state_key))
+        success = tool_output.get("status") == "success"
+        consistency_ok, consistency_reason = validate_consistency(tool_name, tool_output) if tool_output else (False, "state缺失或解析失败")
+        metrics.append(
+            {
+                "tool_call_id": tool_id,
+                "tool_name": tool_name,
+                "tool_latency_s": 0.0,
+                "tool_success": success,
+                "consistency_ok": consistency_ok,
+                "consistency_reason": consistency_reason,
+                "tool_output": tool_output,
+            }
+        )
+    return metrics
 
 
 def run_case(case: EvalCase, args: argparse.Namespace) -> dict[str, Any]:
+    # 端到端评测：直接调用 multi_agent 的 LangGraph 图（不再手动构造 chat/completions / tool_calls）
     start_e2e = time.perf_counter()
-    system_prompt = "你是专业A股投研助手，必须基于工具返回数据生成结构化结论。"
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": case.query},
-    ]
     tool_call_metrics: list[dict[str, Any]] = []
-    model_first_latency = 0.0
-    model_second_latency = 0.0
     final_report = ""
     error_message = ""
     status = "Success"
     degraded_e2e = False
     error_stage = ""
     try:
-        first_resp, model_first_latency = call_chat_completion(
-            base_url=args.base_url,
-            model=args.model,
-            api_key=args.api_key,
-            messages=messages,
-            timeout=args.request_timeout,
-            temperature=args.temperature,
-            tools=TOOLS,
-            max_retries=args.max_retries,
-        )
-        first_msg = first_resp["choices"][0]["message"]
-        tool_calls = normalize_tool_calls(first_msg.get("tool_calls"))
-        if not tool_calls and not args.disable_tool_fallback:
-            tool_calls = [
-                {
-                    "id": f"fallback_{i}",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps({"stock_code": case.stock_code}, ensure_ascii=False),
-                    },
-                }
-                for i, name in enumerate(case.expected_tools)
-            ]
-        messages.append(
-            {
-                "role": "assistant",
-                "content": first_msg.get("content") or "",
-                "tool_calls": tool_calls,
-            }
-        )
-        def execute_tool_call(tc: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-            tool_name = tc["function"]["name"]
-            tool_id = tc["id"]
-            try:
-                tool_args = json.loads(tc["function"].get("arguments") or "{}")
-            except json.JSONDecodeError:
-                tool_args = {"stock_code": case.stock_code}
-            tool_start = time.perf_counter()
-            output = invoke_tool(tool_name, tool_args)
-            tool_latency = time.perf_counter() - tool_start
-            consistency_ok, consistency_reason = validate_consistency(tool_name, output)
-            success = output.get("status") == "success"
-            metric = {
-                "tool_call_id": tool_id,
-                "tool_name": tool_name,
-                "tool_latency_s": round(tool_latency, 4),
-                "tool_success": success,
-                "consistency_ok": consistency_ok,
-                "consistency_reason": consistency_reason,
-                "tool_output": output,
-            }
-            tool_msg = {
-                "role": "tool",
-                "tool_call_id": tool_id,
-                "name": tool_name,
-                "content": json.dumps(output, ensure_ascii=False),
-            }
-            return metric, tool_msg
+        if multi_agent_app is None:
+            raise RuntimeError("multi_agent_app 初始化失败：请检查 multi_agent.py 及其依赖是否可导入")
 
-        if tool_calls:
-            indexed_calls = list(enumerate(tool_calls))
-            results_by_index: dict[int, tuple[dict[str, Any], dict[str, Any]]] = {}
-            max_workers = resolve_tool_workers(args, len(indexed_calls))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_map = {executor.submit(execute_tool_call, tc): idx for idx, tc in indexed_calls}
-                for future in concurrent.futures.as_completed(future_map):
-                    idx = future_map[future]
-                    results_by_index[idx] = future.result()
-            for idx in range(len(indexed_calls)):
-                metric, tool_msg = results_by_index[idx]
-                tool_call_metrics.append(metric)
-                messages.append(tool_msg)
+        # 运行多智能体图，返回 State（包含4个专家结果 + final_report）
+        state = multi_agent_app.invoke({"stock_code": case.stock_code})
 
-        if tool_calls:
-            try:
-                second_resp, model_second_latency = call_chat_completion(
-                    base_url=args.base_url,
-                    model=args.model,
-                    api_key=args.api_key,
-                    messages=messages,
-                    timeout=args.request_timeout,
-                    temperature=args.temperature,
-                    max_retries=args.max_retries,
-                )
-                final_report = second_resp["choices"][0]["message"].get("content") or ""
-            except Exception as second_exc:
-                degraded_e2e = True
-                error_stage = "second_completion"
-                error_message = str(second_exc)
-                final_report = synthesize_report_from_tools(case, tool_call_metrics, error_message)
-                status = "Success"
-        else:
-            final_report = first_msg.get("content") or ""
+        # 1) 从 State 提取最终研报
+        final_report = state.get("final_report", "") or ""
+
+        # 2) 从 State 提取四个专家产出，计算工具成功率与一致性
+        tool_call_metrics = build_tool_metrics_from_state(state, case)
     except Exception as exc:
         status = "Failed"
         error_message = str(exc)
-        error_stage = "first_completion_or_tools"
+        error_stage = "graph_invoke"
     e2e_latency = time.perf_counter() - start_e2e
     tool_total = len(tool_call_metrics)
     tool_success = sum(1 for x in tool_call_metrics if x["tool_success"])
     tool_consistency = sum(1 for x in tool_call_metrics if x["consistency_ok"])
-    called_tools = {x["tool_name"] for x in tool_call_metrics}
+    called_tools = {x["tool_name"] for x in tool_call_metrics if x.get("tool_output")}
     expected_tools = set(case.expected_tools)
     objective_result = objective_eval(final_report) if final_report else {"objective_score": 0, "details": {}}
     llm_result = llm_subjective_eval(final_report) if args.enable_llm_judge and final_report else {"llm_score": 0, "reasoning": ""}
@@ -554,8 +321,8 @@ def run_case(case: EvalCase, args: argparse.Namespace) -> dict[str, Any]:
         "tool_success_rate": (tool_success / tool_total) if tool_total else 0.0,
         "data_consistency_rate": (tool_consistency / tool_total) if tool_total else 0.0,
         "expected_tool_coverage": (len(called_tools & expected_tools) / len(expected_tools)) if expected_tools else 1.0,
-        "model_first_latency_s": round(model_first_latency, 4),
-        "model_second_latency_s": round(model_second_latency, 4),
+        "model_first_latency_s": 0.0,
+        "model_second_latency_s": 0.0,
         "e2e_latency_s": round(e2e_latency, 4),
         "objective_score_40": objective_result["objective_score"],
         "llm_score_60": llm_result.get("llm_score", 0),
@@ -571,17 +338,46 @@ def run_evaluation(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict
     selected_stocks = resolve_stocks(args)
     cases = build_eval_cases(selected_stocks)
     print(f"评测股票数量: {len(selected_stocks)}")
-    all_results = []
-    for case in cases:
-        print(f"开始评测: {case.case_id}")
-        result = run_case(case, args)
-        all_results.append(result)
-        print(
-            f"完成评测: {case.case_id} | status={result['status']} | "
-            f"tool_success_rate={result['tool_success_rate']:.2%} | "
-            f"consistency_rate={result['data_consistency_rate']:.2%} | "
-            f"e2e={result['e2e_latency_s']:.2f}s"
-        )
+    all_results: list[dict[str, Any]] = []
+
+    # Case 级并发：同时评测多支股票
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.case_workers)) as executor:
+        future_map = {executor.submit(run_case, case, args): case for case in cases}
+        for future in concurrent.futures.as_completed(future_map):
+            case = future_map[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "case_id": case.case_id,
+                    "stock_code": case.stock_code,
+                    "status": "Failed",
+                    "error": str(exc),
+                    "error_stage": "case_future",
+                    "degraded_e2e": False,
+                    "tool_calls_total": 0,
+                    "tool_calls_success": 0,
+                    "tool_success_rate": 0.0,
+                    "data_consistency_rate": 0.0,
+                    "expected_tool_coverage": 0.0,
+                    "model_first_latency_s": 0.0,
+                    "model_second_latency_s": 0.0,
+                    "e2e_latency_s": 0.0,
+                    "objective_score_40": 0,
+                    "llm_score_60": 0,
+                    "total_quality_score_100": 0,
+                    "quality_missing_elements": [],
+                    "judge_reason": "",
+                    "final_report_preview": "",
+                    "tool_call_metrics": [],
+                }
+            all_results.append(result)
+            print(
+                f"完成评测: {result['case_id']} | status={result['status']} | "
+                f"tool_success_rate={result['tool_success_rate']:.2%} | "
+                f"consistency_rate={result['data_consistency_rate']:.2%} | "
+                f"e2e={result['e2e_latency_s']:.2f}s"
+            )
     success_cases = [x for x in all_results if x["status"] == "Success"]
     e2e_latencies = [x["e2e_latency_s"] for x in all_results]
     tool_success_all = [x["tool_success_rate"] for x in all_results]

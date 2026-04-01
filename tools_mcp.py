@@ -104,36 +104,38 @@ def _parse_socks_proxy(proxy_url: str):
 
 @contextmanager
 def _baostock_proxy_context():
-    if not BAOSTOCK_PROXY:
-        yield
-        return
-    if socks is None:
-        raise RuntimeError("未安装PySocks，无法启用BAOSTOCK_SOCKS5_PROXY")
-    cfg = _parse_socks_proxy(BAOSTOCK_PROXY)
-    original_socket = socket.socket
-    socks.set_default_proxy(
-        proxy_type=socks.SOCKS5,
-        addr=cfg["host"],
-        port=cfg["port"],
-        username=cfg["username"],
-        password=cfg["password"],
-        rdns=cfg["rdns"],
-    )
-    socket.socket = socks.socksocket
-    try:
-        yield
-    finally:
-        socket.socket = original_socket
-        socks.set_default_proxy()
-
+    # if not BAOSTOCK_PROXY:
+    #     yield
+    #     return
+    # if socks is None:
+    #     raise RuntimeError("未安装PySocks，无法启用BAOSTOCK_SOCKS5_PROXY")
+    # cfg = _parse_socks_proxy(BAOSTOCK_PROXY)
+    # original_socket = socket.socket
+    # socks.set_default_proxy(
+    #     proxy_type=socks.SOCKS5,
+    #     addr=cfg["host"],
+    #     port=cfg["port"],
+    #     username=cfg["username"],
+    #     password=cfg["password"],
+    #     rdns=cfg["rdns"],
+    # )
+    # socket.socket = socks.socksocket
+    # try:
+    #     yield
+    # finally:
+    #     socket.socket = original_socket
+    #     socks.set_default_proxy()
+    yield
+    return
 
 def _query_baostock(bs_code: str, fields: str, start_date: str, end_date: str):
     if not BAOSTOCK_ENABLED:
         raise RuntimeError("USE_BAOSTOCK未启用")
     last_error = "unknown"
     for _ in range(max(1, BAOSTOCK_RETRIES + 1)):
-        try:
-            with bs_lock:
+        # 【关键修改】：先拿锁，再 try...finally
+        with bs_lock:
+            try:
                 with _baostock_proxy_context():
                     lg = bs.login()
                     if getattr(lg, "error_code", "0") != "0":
@@ -152,14 +154,15 @@ def _query_baostock(bs_code: str, fields: str, start_date: str, end_date: str):
                     while (rs.error_code == "0") and rs.next():
                         data_list.append(rs.get_row_data())
                     return data_list, rs.fields
-        except Exception as exc:
-            last_error = str(exc)
-            time.sleep(BAOSTOCK_RETRY_DELAY)
-        finally:
-            try:
-                bs.logout()
-            except Exception:
-                pass
+            except Exception as exc:
+                last_error = str(exc)
+                time.sleep(BAOSTOCK_RETRY_DELAY)
+            finally:
+                try:
+                    # 现在的 logout 是在释放锁之前执行的，绝对安全！
+                    bs.logout()
+                except Exception:
+                    pass
     raise RuntimeError(last_error)
 
 
@@ -395,8 +398,9 @@ def get_news_sentiment(stock_code: str) -> dict:
 
     print(f"-> [工具后台] 正在请求本地 Qwen2.5-7B(LoRA) 分析新闻情感...")
     try:
+        headers = {"Connection": "close"}
         response = requests.post(
-            "http://localhost:8000/v1/chat/completions",
+            "http://127.0.0.1:8000/v1/chat/completions",
             json={
                 "model": "finance_news", 
                 "messages": [
@@ -411,6 +415,9 @@ def get_news_sentiment(stock_code: str) -> dict:
                 ],
                 "temperature": 0.1 
             },
+            proxies={"http": None, "https": None}, 
+            # 🔪 每次请求后立刻关闭连接，防止 vLLM 的 TCP 队列拥塞
+            headers={"Connection": "close"},
             timeout=90,
         )
         response.raise_for_status()
