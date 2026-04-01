@@ -1,7 +1,8 @@
 import os
 os.environ["NO_PROXY"] = "127.0.0.1,localhost,0.0.0.0"
+import ast
 import json
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -26,6 +27,16 @@ llm = ChatOpenAI(
     temperature=0.2,
 )
 
+
+def _extract_tool_args(ai_msg: Any, stock_code: str) -> dict:
+    tool_calls = getattr(ai_msg, "tool_calls", None) or []
+    if tool_calls and isinstance(tool_calls, list) and isinstance(tool_calls[0], dict):
+        args = tool_calls[0].get("args")
+        if isinstance(args, dict):
+            return args
+    return {"stock_code": stock_code}
+
+
 # =========================================================
 # 2) 定义 State（图的共享状态）
 # =========================================================
@@ -42,31 +53,42 @@ class StockState(TypedDict):
 
 
 # =========================================================
-# 3) 专家节点：直接调用工具（并行执行）
-#    注意：工具返回为 dict，这里统一转为 JSON 字符串存入 state
+# 3) 专家节点：大模型驱动的工具调用（并行执行）
 # =========================================================
 def fundamental_agent(state: StockState) -> StockState:
-    code = state["stock_code"]
-    res = get_fundamental_data.invoke({"stock_code": code})
-    return {"fundamental_data": json.dumps(res, ensure_ascii=False)}
+    llm_with_tools = llm.bind_tools([get_fundamental_data], tool_choice="get_fundamental_data")
+    prompt = f"请获取股票 {state['stock_code']} 的基本面数据。"
+    ai_msg = llm_with_tools.invoke([HumanMessage(content=prompt)])
+    tool_args = _extract_tool_args(ai_msg, state["stock_code"])
+    res = get_fundamental_data.invoke(tool_args)
+    return {"fundamental_data": str(res)}
 
 
 def technical_agent(state: StockState) -> StockState:
-    code = state["stock_code"]
-    res = get_technical_data.invoke({"stock_code": code})
-    return {"technical_data": json.dumps(res, ensure_ascii=False)}
+    llm_with_tools = llm.bind_tools([get_technical_data], tool_choice="get_technical_data")
+    prompt = f"请获取股票 {state['stock_code']} 的技术面数据。"
+    ai_msg = llm_with_tools.invoke([HumanMessage(content=prompt)])
+    tool_args = _extract_tool_args(ai_msg, state["stock_code"])
+    res = get_technical_data.invoke(tool_args)
+    return {"technical_data": str(res)}
 
 
 def news_agent(state: StockState) -> StockState:
-    code = state["stock_code"]
-    res = get_news_sentiment.invoke({"stock_code": code})
-    return {"news_data": json.dumps(res, ensure_ascii=False)}
+    llm_with_tools = llm.bind_tools([get_news_sentiment], tool_choice="get_news_sentiment")
+    prompt = f"请获取股票 {state['stock_code']} 的消息面（新闻情绪）数据。"
+    ai_msg = llm_with_tools.invoke([HumanMessage(content=prompt)])
+    tool_args = _extract_tool_args(ai_msg, state["stock_code"])
+    res = get_news_sentiment.invoke(tool_args)
+    return {"news_data": str(res)}
 
 
 def valuation_agent(state: StockState) -> StockState:
-    code = state["stock_code"]
-    res = get_valuation_data.invoke({"stock_code": code})
-    return {"valuation_data": json.dumps(res, ensure_ascii=False)}
+    llm_with_tools = llm.bind_tools([get_valuation_data], tool_choice="get_valuation_data")
+    prompt = f"请获取股票 {state['stock_code']} 的估值面数据。"
+    ai_msg = llm_with_tools.invoke([HumanMessage(content=prompt)])
+    tool_args = _extract_tool_args(ai_msg, state["stock_code"])
+    res = get_valuation_data.invoke(tool_args)
+    return {"valuation_data": str(res)}
 
 
 # =========================================================
@@ -89,7 +111,11 @@ def chief_editor_agent(state: StockState) -> StockState:
             obj = json.loads(text) if text else {}
             return json.dumps(obj, ensure_ascii=False, indent=2)
         except Exception:
-            return text or ""
+            try:
+                obj = ast.literal_eval(text) if text else {}
+                return json.dumps(obj, ensure_ascii=False, indent=2) if isinstance(obj, dict) else (text or "")
+            except Exception:
+                return text or ""
 
     fundamental = _pretty(state.get("fundamental_data", ""))
     technical = _pretty(state.get("technical_data", ""))
@@ -118,29 +144,32 @@ def chief_editor_agent(state: StockState) -> StockState:
 # 5) 构建 LangGraph：4 并行专家节点 + 1 汇聚主编节点
 # =========================================================
 def build_app():
-    graph = StateGraph(StockState)
+    workflow = StateGraph(StockState)
     # 注册节点
-    graph.add_node("fundamental_agent", fundamental_agent)
-    graph.add_node("technical_agent", technical_agent)
-    graph.add_node("news_agent", news_agent)
-    graph.add_node("valuation_agent", valuation_agent)
-    graph.add_node("chief_editor_agent", chief_editor_agent)
+    workflow.add_node("fundamental_agent", fundamental_agent)
+    workflow.add_node("technical_agent", technical_agent)
+    workflow.add_node("news_agent", news_agent)
+    workflow.add_node("valuation_agent", valuation_agent)
+    workflow.add_node("chief_editor_agent", chief_editor_agent)
 
     # Fan-out：从 START 并行触发 4 个专家节点
-    graph.add_edge(START, "fundamental_agent")
-    graph.add_edge(START, "technical_agent")
-    graph.add_edge(START, "news_agent")
-    graph.add_edge(START, "valuation_agent")
+    workflow.add_edge(START, "fundamental_agent")
+    workflow.add_edge(START, "technical_agent")
+    workflow.add_edge(START, "news_agent")
+    workflow.add_edge(START, "valuation_agent")
 
     # Fan-in：4 个专家节点全部汇聚到主编节点
-    graph.add_edge("fundamental_agent", "chief_editor_agent")
-    graph.add_edge("technical_agent", "chief_editor_agent")
-    graph.add_edge("news_agent", "chief_editor_agent")
-    graph.add_edge("valuation_agent", "chief_editor_agent")
+    workflow.add_edge("fundamental_agent", "chief_editor_agent")
+    workflow.add_edge("technical_agent", "chief_editor_agent")
+    workflow.add_edge("news_agent", "chief_editor_agent")
+    workflow.add_edge("valuation_agent", "chief_editor_agent")
 
     # 结束
-    graph.add_edge("chief_editor_agent", END)
-    return graph.compile()
+    workflow.add_edge("chief_editor_agent", END)
+    return workflow.compile()
+
+
+multi_agent_app = build_app()
 
 
 # =========================================================
@@ -150,9 +179,8 @@ if __name__ == "__main__":
     stock_query = "600519"
     print(f"=== 并行多智能体（Multi-Agent）启动：{stock_query} ===")
 
-    app = build_app()
     # 运行图：输入仅需 stock_code，其余字段由节点写入
-    result = app.invoke({"stock_code": stock_query})
+    result = multi_agent_app.invoke({"stock_code": stock_query})
 
     final_report = result.get("final_report", "")
     print("\n=== 最终研报（摘要） ===\n")
